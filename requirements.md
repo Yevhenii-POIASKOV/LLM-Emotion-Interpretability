@@ -26,4 +26,4 @@ pip install spyder-kernels==3.1.*
 pip install transformer_lens seaborn matplotlib pandas scikit-learn
 
 # Встановлюємо PyTorch (версія з підтримкою CUDA 12.4 для NVIDIA GPU)
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url [https://download.pytorch.org/whl/cu124](https://download.pytorch.org/whl/cu124)
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
