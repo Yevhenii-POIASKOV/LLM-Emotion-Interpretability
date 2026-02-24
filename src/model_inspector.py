@@ -30,8 +30,10 @@ all_labels = []
 
 print(f"📊 Починаємо збір даних...")
 
+names_filter = [f"blocks.{b}.mlp.hook_post" for b in blocks_to_save]
+
 for batch in get_emotional_batches(batch_size=16, model=model):
-    names_filter = [f"blocks.{b}.mlp.hook_post" for b in blocks_to_save]
+    
     
     with torch.no_grad():
         _, cache = model.run_with_cache(batch.tokens, names_filter=names_filter)
