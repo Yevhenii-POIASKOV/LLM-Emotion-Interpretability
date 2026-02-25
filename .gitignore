@@ -1,0 +1,15 @@
+outputs/heatmaps/
+outputs/reports/
+data/activations/
+.idea/
+/shelf/
+/workspace.xml
+/queries/
+/dataSources/
+/dataSources.local.xml
+/httpRequests/
+__pycache__/
+*.pyc
+*.pyo
+outputs/logs/
+**/.gitkeep
