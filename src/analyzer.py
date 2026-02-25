@@ -660,11 +660,7 @@ def main() -> None:
     print(f"[analyzer] saved reports to: {out_dir}")
 
     # selection flags: default per-layer unless --select_global is set
-    per_layer = True
-    if args.select_global:
-        per_layer = False
-    elif args.select_per_layer:
-        per_layer = True
+    per_layer = not args.select_global
 
     selection = select_neurons(
         stats_map,
