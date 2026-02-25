@@ -353,8 +353,13 @@ def save_selected_neurons(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "run_dir": run_dir,
         "run_name": run_name,
-        **selection,
     }
+
+    collision_keys = set(payload).intersection(selection)
+    if collision_keys:
+        raise ValueError(f"Key collision while building selection payload: {sorted(collision_keys)}")
+
+    payload.update(selection)
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
