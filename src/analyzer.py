@@ -35,7 +35,7 @@ data/activations/run_YYYYMMDD_HHMM/
   # Найбільш чутливі (емоційні) нейрони: global top-50 за effect_size + bootstrap-check
   python -m src.analyzer --run_dir data/activations/run_... --select_global --select_top_n 50
 
-Bootstrap перевірка (дефолт увімкнена):
+Bootstrap перевірка (дефолт вимкнена):
   --bootstrap_enable
   --bootstrap_candidates 200   (скільки кандидатів перевіряти)
   --bootstrap_iters 1000       (кількість bootstrap ітерацій)
