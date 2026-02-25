@@ -202,7 +202,9 @@ def compute_layer_stats(acts: np.ndarray, labels: np.ndarray, layer: int) -> Lay
     eta2 = between_var / (between_var + within_var + eps)
 
     # simple signal-to-noise ratio
-    snr = abs_delta / (std_pos + std_neg + 1e-8)
+    snr_eps = 1e-8
+    snr_denom = np.maximum(std_pos + std_neg, snr_eps)
+    snr = abs_delta / snr_denom
 
     return LayerStats(
         layer=layer,
