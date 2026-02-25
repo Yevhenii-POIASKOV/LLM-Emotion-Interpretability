@@ -572,8 +572,12 @@ def save_outputs(
         "run_name": run_name,
         "layers": sorted(layer_stats_map.keys()),
         "topk_per_layer": topk,
-        **tops,
     }
+    # Merge tops into summary while guarding against key collisions
+    collision_keys = set(summary).intersection(tops)
+    if collision_keys:
+        raise ValueError(f"Key collision while building analyzer summary: {sorted(collision_keys)}")
+    summary.update(tops)
 
     json_path = os.path.join(out_dir, f"analyzer_{run_name}.json")
     with open(json_path, "w", encoding="utf-8") as f:
