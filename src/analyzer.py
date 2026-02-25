@@ -393,7 +393,9 @@ def bootstrap_delta_ci_for_neuron(
     n_pos = x_pos.shape[0]
     n_neg = x_neg.shape[0]
     if n_pos == 0 or n_neg == 0:
-        raise ValueError("Need both pos and neg samples for bootstrap.")
+        raise ValueError(
+            f"Need both pos and neg samples for bootstrap (neuron_idx={neuron_idx})."
+        )
 
     delta_hat = float(x_pos.mean() - x_neg.mean())
 
