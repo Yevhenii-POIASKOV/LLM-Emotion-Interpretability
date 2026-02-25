@@ -695,7 +695,7 @@ def main() -> None:
                     "generated_at": datetime.now().isoformat(timespec="seconds"),
                     "run_dir": run_dir,
                     "run_name": run_name,
-                    **boot,
+                    "bootstrap_data": boot,
                 },
                 f,
                 ensure_ascii=False,
