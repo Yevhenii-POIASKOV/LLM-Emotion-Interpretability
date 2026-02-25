@@ -178,7 +178,10 @@ def compute_layer_stats(acts: np.ndarray, labels: np.ndarray, layer: int) -> Lay
     n_neg = int(neg_mask.sum())
     if n_pos == 0 or n_neg == 0:
         raise ValueError(f"Layer {layer}: need both pos and neg samples. n_pos={n_pos}, n_neg={n_neg}")
-
+    if n_pos < 2 or n_neg < 2:
+        raise ValueError(
+            f"Layer {layer}: need >=2 samples per class for ddof=1 std. n_pos={n_pos}, n_neg={n_neg}")
+    
     acts_pos = acts[pos_mask]
     acts_neg = acts[neg_mask]
 
@@ -186,9 +189,9 @@ def compute_layer_stats(acts: np.ndarray, labels: np.ndarray, layer: int) -> Lay
     mean_neg = acts_neg.mean(axis=0)
     delta = mean_pos - mean_neg
 
-    std_all = acts.std(axis=0, ddof=0)
-    std_pos = acts_pos.std(axis=0, ddof=0)
-    std_neg = acts_neg.std(axis=0, ddof=0)
+    std_all = acts.std(axis=0, ddof=1)
+    std_pos = acts_pos.std(axis=0, ddof=1)
+    std_neg = acts_neg.std(axis=0, ddof=1)
 
     abs_delta = np.abs(delta)
     effect_size = _cohens_d(mean_pos, mean_neg, std_pos, std_neg, n_pos=n_pos, n_neg=n_neg)
