@@ -29,7 +29,7 @@ data/activations/run_YYYYMMDD_HHMM/
 
 Простіший запуск як файл:
   cd <repo_root>/src
-  python analyzer.py --run_dir ..\\data\\activations\\run_20260225_0035
+  python analyzer.py --run_dir ../data/activations/run_20260225_0035
 
 Керування selection:
   # Найбільш чутливі (емоційні) нейрони: global top-50 за effect_size + bootstrap-check
