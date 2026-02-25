@@ -563,7 +563,7 @@ class Visualizer:
         print(f"[viz] run_name  : {self.run_name}")
         print(f"[viz] layers    : {self.layers}")
         print(f"[viz] out_dir   : {self.out_dir}")
-        print(f"[viz] plotly    : 'yes' if _PLOTLY_AVAILABLE else 'no (not installed, HTML disabled)'")
+        print(f"[viz] plotly    : {'yes' if _PLOTLY_AVAILABLE else 'no (not installed, HTML disabled)'}")
 
     def _p(self, filename: str) -> str:
         return os.path.join(self.out_dir, filename)
