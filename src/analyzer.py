@@ -195,7 +195,7 @@ def compute_layer_stats(acts: np.ndarray, labels: np.ndarray, layer: int) -> Lay
 
     # Variability decomposition: between vs within (2-class)
     n = n_pos + n_neg
-    between_var = (n_pos * n_neg) / (n * n) * (delta**2)
+    between_var = (n_pos * n_neg) / n * (delta**2)
     within_var = ((n_pos - 1) * (std_pos**2) + (n_neg - 1) * (std_neg**2)) / max((n - 2), 1)
 
     eps = 1e-12
