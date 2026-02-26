@@ -1,698 +1,582 @@
-"""
-clustering.py — Фінальний етап проєкту LLM Emotion Interpretability.
+"""Binary clustering of GPT-2 neurons into emotional vs neutral groups.
 
-Виконує бінарну кластеризацію нейронів GPT-2 на "емоційні" та "нейтральні"
-на основі статистичних метрик з analyzer.py. Використовує K-Means з оцінкою
-стабільності через багатократні запуски.
+This script is the final stage of the LLM Emotion Interpretability project.
+It reads analyzer outputs, builds a feature matrix across all neurons, runs
+binary K-Means multiple times, identifies the emotional cluster, and saves
+neurons that are *consistently* emotional (stability = 1.0).
 
-Usage:
-    python src/clustering.py --run_name baseline
-    python src/clustering.py --run_name baseline --features effect_size eta2 snr --n_iter 20
+Outputs (under outputs/reports/):
+  - emotional_clusters_<run_name>.json   : full stable emotional neurons
+  - emotional_clusters_<run_name>.summary.json : compact machine-readable summary
+  - emotional_clusters_<run_name>.summary.md   : human-readable summary
+  - emotional_clusters_<run_name>.report.md    : detailed report (counts, top list)
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import logging
 import os
-import sys
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Data classes
 # ---------------------------------------------------------------------------
-
-@dataclass
-class NeuronRecord:
-    """Запис про один нейрон з метриками та результатами кластеризації."""
-
-    layer: int
-    neuron: int
-    effect_size: float
-    eta2: float
-    snr: float
-    abs_delta: float
-    cluster_label: int = -1
-    stability: float = 0.0
-
-    def to_dict(self) -> dict:
-        """Серіалізація у словник для JSON-виводу."""
-        return {
-            "layer": self.layer,
-            "neuron": self.neuron,
-            "effect_size": round(self.effect_size, 6),
-            "eta2": round(self.eta2, 6),
-            "snr": round(self.snr, 6),
-            "abs_delta": round(self.abs_delta, 6),
-            "stability": round(self.stability, 4),
-        }
-
-
-@dataclass
-class ClusteringResult:
-    """Зведені результати кластеризації."""
+@dataclass(frozen=True)
+class ClusterConfig:
+    """Configuration for clustering and reporting."""
 
     run_name: str
-    n_neurons_total: int
-    n_emotional: int
-    silhouette: float
-    emotional_cluster_id: int
-    stability_threshold: float = 0.8
-    stable_neurons: list[NeuronRecord] = field(default_factory=list)
+    features: Tuple[str, ...]
+    iterations: int = 10
+    random_seed: int = 42
+    n_init: int = 20
+    report_top_k: int = 50
+    report_make_plots: bool = False
 
-    def summary(self) -> str:
-        lines = [
-            "=" * 60,
-            f"  Результати кластеризації: {self.run_name}",
-            "=" * 60,
-            f"  Усього нейронів:          {self.n_neurons_total}",
-            f"  Емоційний кластер ID:      {self.emotional_cluster_id}",
-            f"  Нейронів в емоц. кластері: {self.n_emotional}",
-            f"  Поріг стабільності:        {self.stability_threshold:.0%}",
-            f"  Стабільно емоційних:       {len(self.stable_neurons)}",
-            f"  Silhouette Score:          {self.silhouette:.4f}",
-            "=" * 60,
-        ]
-        return "\n".join(lines)
+
+@dataclass(frozen=True)
+class LoadedMetrics:
+    """Container for stacked analyzer metrics."""
+
+    layer_ids: np.ndarray  # shape (N,)
+    neuron_ids: np.ndarray  # shape (N,)
+    feature_matrix: np.ndarray  # shape (N, n_features)
+    effect_size: np.ndarray  # shape (N,)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+LAYER_FILE_RE = re.compile(r"analyzer_(?P<run>.+)_layer_(?P<layer>\d+)\.npz$")
+
+
+def repo_root_from_here() -> Path:
+    """Return repository root inferred from this file location."""
+    return Path(__file__).resolve().parent.parent
+
+
+def safe_makedirs(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
 # Core class
 # ---------------------------------------------------------------------------
-
 class NeuronClusterizer:
-    """
-    Виконує бінарну кластеризацію нейронів LLM на "емоційні" та "нейтральні".
+    """Cluster GPT-2 neurons into emotional vs neutral using analyzer metrics."""
 
-    Parameters
-    ----------
-    run_name : str
-        Назва запуску — використовується для пошуку .npz файлів.
-    features : list[str]
-        Перелік метрик із .npz файлів, що будуть ознаками для кластеризації.
-    n_iter : int
-        Кількість незалежних запусків K-Means для оцінки стабільності.
-    reports_dir : Path
-        Шлях до директорії з .npz файлами та куди зберігаються результати.
-    stability_threshold : float
-        Мінімальна частка запусків, у яких нейрон має потрапити в емоційний
-        кластер, щоб вважатись стабільно емоційним. За замовчуванням 0.8
-        (80 % запусків). Значення 1.0 вимагає 100 % збігів.
-    """
+    def __init__(self, config: ClusterConfig) -> None:
+        self.config = config
+        self.repo_root = repo_root_from_here()
+        self.reports_dir = self.repo_root / "outputs" / "reports"
 
-    SUPPORTED_FEATURES = {"effect_size", "eta2", "snr", "abs_delta"}
-    N_NEURONS_PER_LAYER = 3072  # GPT-2 hidden dim
-
-    def __init__(
-        self,
-        run_name: str,
-        features: list[str],
-        n_iter: int,
-        reports_dir: Path,
-        stability_threshold: float = 0.8,
-    ) -> None:
-        self.run_name = run_name
-        self.features = features
-        self.n_iter = n_iter
-        self.reports_dir = reports_dir
-        self.stability_threshold = stability_threshold
-        self._validate_features()
-        self._validate_threshold()
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
-
-    def _validate_features(self) -> None:
-        """Перевіряє, чи підтримуються вказані ознаки."""
-        unknown = set(self.features) - self.SUPPORTED_FEATURES
-        if unknown:
-            raise ValueError(
-                f"Непідтримувані ознаки: {unknown}. "
-                f"Доступні: {self.SUPPORTED_FEATURES}"
-            )
-        if len(self.features) < 1:
-            raise ValueError("Необхідна хоча б одна ознака для кластеризації.")
-
-    def _validate_threshold(self) -> None:
-        """Перевіряє допустимість порогу стабільності."""
-        if not (0.0 < self.stability_threshold <= 1.0):
-            raise ValueError(
-                f"stability_threshold має бути в діапазоні (0.0, 1.0], "
-                f"отримано: {self.stability_threshold}"
-            )
-
-    # ------------------------------------------------------------------
-    # Data loading
-    # ------------------------------------------------------------------
-
-    def _find_layer_files(self) -> list[tuple[int, Path]]:
-        """
-        Знаходить усі .npz файли для поточного run_name.
-
-        Returns
-        -------
-        list[tuple[int, Path]]
-            Відсортований список (layer_index, path).
-
-        Raises
-        ------
-        FileNotFoundError
-            Якщо жодного файлу не знайдено.
-        """
-        pattern = f"analyzer_{self.run_name}_layer_*.npz"
-        found = sorted(self.reports_dir.glob(pattern))
-        if not found:
-            raise FileNotFoundError(
-                f"Файли за шаблоном '{pattern}' не знайдені у {self.reports_dir}"
-            )
-
-        result: list[tuple[int, Path]] = []
-        for path in found:
-            # analyzer_<run>_layer_<L>.npz
-            stem = path.stem  # "analyzer_baseline_layer_8"
-            try:
-                layer_idx = int(stem.rsplit("_", 1)[-1])
-            except ValueError:
-                logger.warning("Не вдалося розпізнати номер шару у файлі: %s", path)
-                continue
-            result.append((layer_idx, path))
-
-        logger.info("Знайдено %d файлів шарів для run='%s'", len(result), self.run_name)
-        return result
-
-    def _load_layer(self, layer: int, path: Path) -> list[NeuronRecord]:
-        """
-        Завантажує один .npz файл та повертає список NeuronRecord.
-
-        Parameters
-        ----------
-        layer : int
-            Індекс шару.
-        path : Path
-            Шлях до .npz файлу.
-
-        Returns
-        -------
-        list[NeuronRecord]
-        """
-        try:
-            data = np.load(path, allow_pickle=False)
-        except Exception as exc:
-            raise IOError(f"Не вдалося завантажити {path}: {exc}") from exc
-
-        required_keys = {"effect_size", "eta2", "snr", "abs_delta"}
-        missing = required_keys - set(data.files)
-        if missing:
-            raise KeyError(f"Файл {path.name} не містить ключів: {missing}")
-
-        effect_size: np.ndarray = data["effect_size"]
-        n_neurons = effect_size.shape[0]
-
-        records: list[NeuronRecord] = []
-        for neuron_idx in range(n_neurons):
-            records.append(
-                NeuronRecord(
-                    layer=layer,
-                    neuron=neuron_idx,
-                    effect_size=float(data["effect_size"][neuron_idx]),
-                    eta2=float(data["eta2"][neuron_idx]),
-                    snr=float(data["snr"][neuron_idx]),
-                    abs_delta=float(data["abs_delta"][neuron_idx]),
-                )
-            )
-        return records
-
-    def _build_feature_matrix(
-        self, records: list[NeuronRecord]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Формує матрицю ознак X та стандартизує її.
-
-        Parameters
-        ----------
-        records : list[NeuronRecord]
-
-        Returns
-        -------
-        X_scaled : np.ndarray, shape (N, n_features)
-        X_raw    : np.ndarray, shape (N, n_features)  — нестандартизовані
-        """
-        columns: list[np.ndarray] = []
-        for feat in self.features:
-            col = np.array([getattr(r, feat) for r in records], dtype=np.float64)
-            columns.append(col)
-
-        X_raw = np.column_stack(columns)
-
-        # Замінюємо NaN/Inf на нульові значення (захист від артефактів)
-        if not np.all(np.isfinite(X_raw)):
-            n_bad = np.sum(~np.isfinite(X_raw))
-            logger.warning(
-                "Виявлено %d нескінченних/NaN значень у матриці ознак — замінено на 0.",
-                n_bad,
-            )
-            X_raw = np.where(np.isfinite(X_raw), X_raw, 0.0)
-
-        scaler = StandardScaler()
-        X_scaled: np.ndarray = scaler.fit_transform(X_raw)
-        return X_scaled, X_raw
-
-    # ------------------------------------------------------------------
-    # Clustering helpers
-    # ------------------------------------------------------------------
-
-    def _run_kmeans_once(
-        self, X: np.ndarray, random_state: int
-    ) -> tuple[np.ndarray, int, np.ndarray]:
-        """
-        Один запуск KMeans(n_clusters=2).
-
-        Returns
-        -------
-        labels : np.ndarray
-            Мітки кластерів (0 або 1) для кожного нейрона.
-        emotional_cluster_id : int
-            ID кластеру з вищим середнім |effect_size| у центроїді.
-        centroids : np.ndarray, shape (2, n_features)
-            Координати центроїдів у стандартизованому просторі.
-        """
-        km = KMeans(
-            n_clusters=2,
-            random_state=random_state,
-            n_init="auto",
-        )
-        labels: np.ndarray = km.fit_predict(X)
-
-        feature_idx = (
-            self.features.index("effect_size")
-            if "effect_size" in self.features
-            else 0
-        )
-        centroid_vals = np.abs(km.cluster_centers_[:, feature_idx])
-        emotional_cluster_id = int(np.argmax(centroid_vals))
-        return labels, emotional_cluster_id, km.cluster_centers_
-
-    def _identify_emotional_cluster(
-        self, records: list[NeuronRecord], X: np.ndarray
-    ) -> int:
-        """
-        Головний запуск кластеризації: повертає emotional_cluster_id та
-        встановлює cluster_label кожному NeuronRecord.
-        """
-        labels, emotional_cluster_id, _ = self._run_kmeans_once(X, random_state=42)
-        for rec, label in zip(records, labels):
-            rec.cluster_label = int(label)
-        logger.info(
-            "Головний запуск: емоційний кластер = %d", emotional_cluster_id
-        )
-        return emotional_cluster_id
-
-    # ------------------------------------------------------------------
-    # Stability assessment
-    # ------------------------------------------------------------------
-
-    def _assess_stability(
-        self,
-        records: list[NeuronRecord],
-        X: np.ndarray,
-        emotional_cluster_id_main: int,
-    ) -> None:
-        """
-        Запускає KMeans N разів та рахує стабільність через відстань до
-        центроїдів — це усуває проблему label switching між запусками.
-
-        На кожній ітерації для кожного нейрона обчислюється відстань до
-        обох центроїдів. Нейрон вважається "емоційним" якщо він ближчий
-        до емоційного центроїду (незалежно від ID кластеру).
-        """
-        n = len(records)
-        hit_counts = np.zeros(n, dtype=np.int32)
-
-        logger.info("Запуск оцінки стабільності (%d ітерацій)...", self.n_iter)
-
-        feature_idx = (
-            self.features.index("effect_size")
-            if "effect_size" in self.features
-            else 0
-        )
-
-        for i in range(self.n_iter):
-            _, _, centroids = self._run_kmeans_once(X, random_state=i)
-
-            # Визначаємо емоційний центроїд за |effect_size|
-            emo_centroid_id = int(np.argmax(np.abs(centroids[:, feature_idx])))
-            emo_centroid = centroids[emo_centroid_id]       # shape (n_features,)
-            neu_centroid = centroids[1 - emo_centroid_id]  # shape (n_features,)
-
-            # Відстань кожного нейрона до обох центроїдів (евклідова)
-            dist_to_emo = np.linalg.norm(X - emo_centroid, axis=1)
-            dist_to_neu = np.linalg.norm(X - neu_centroid, axis=1)
-
-            # Нейрон "емоційний" якщо він ближчий до емоційного центроїду
-            is_emotional = (dist_to_emo < dist_to_neu).astype(np.int32)
-            hit_counts += is_emotional
-
-            if (i + 1) % max(1, self.n_iter // 5) == 0:
-                n_emo_this = int(is_emotional.sum())
-                logger.info(
-                    "  Ітерація %3d/%d завершена. "
-                    "(emo_centroid=%d, емоційних=%d)",
-                    i + 1, self.n_iter, emo_centroid_id, n_emo_this,
-                )
-
-        stability_scores = hit_counts / self.n_iter
-
-        # Діагностика розподілу stability
-        thresholds = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
-        hist, _ = np.histogram(stability_scores, bins=thresholds)
-        logger.info("Розподіл stability scores (всього нейронів %d):", n)
-        for lo, hi, cnt in zip(thresholds[:-1], thresholds[1:], hist):
-            bar = "█" * min(cnt // 200, 30)
-            logger.info("  [%.1f – %.1f): %6d  %s", lo, min(hi, 1.0), cnt, bar)
-
-        for rec, stab in zip(records, stability_scores):
-            rec.stability = float(stab)
-
-        n_stable = int(np.sum(stability_scores >= self.stability_threshold))
-        logger.info(
-            "Стабільно емоційних нейронів (≥%.0f%%): %d / %d",
-            self.stability_threshold * 100,
-            n_stable,
-            n,
-        )
-
-    # ------------------------------------------------------------------
+    # -----------------------------
     # Public API
-    # ------------------------------------------------------------------
+    # -----------------------------
+    def run(self) -> str:
+        """Execute full clustering pipeline and return path to main JSON output."""
+        loaded = self._load_metrics()
+        x_scaled = self._standardize_features(loaded.feature_matrix)
 
-    def run(self) -> ClusteringResult:
-        """
-        Виконує повний пайплайн кластеризації.
+        emotional_votes, silhouette_values = self._run_repeated_kmeans(
+            x_scaled=x_scaled,
+            effect_size=loaded.effect_size,
+        )
 
-        Стратегія відбору "емоційних" нейронів — гібридна:
-        1. K-Means(n=2) визначає емоційний кластер за centroid |effect_size|
-        2. Стабільність рахується через відстань до центроїду (не ID кластеру)
-        3. Нейрон потрапляє у фінальний список якщо:
-           - у головному запуску (seed=42) ближчий до емоційного центроїду
-           - stability >= stability_threshold (частка ітерацій де він ближчий)
-           - |effect_size| >= effect_size_threshold (прямий поріг як гарантія)
+        stability = emotional_votes.astype(np.float64) / float(self.config.iterations)
+        records, stable_mask = self._build_stable_records(
+            layer_ids=loaded.layer_ids,
+            neuron_ids=loaded.neuron_ids,
+            effect_size=loaded.effect_size,
+            stability=stability,
+        )
 
-        Returns
-        -------
-        ClusteringResult
-        """
-        # 1. Збір даних
+        safe_makedirs(self.reports_dir)
+        json_path = self._write_emotional_clusters_json(records)
+        summary_json, summary_md = self._write_summary(
+            records=records,
+            layer_ids=loaded.layer_ids,
+            stable_mask=stable_mask,
+            silhouette_values=silhouette_values,
+            total_neurons=int(loaded.feature_matrix.shape[0]),
+        )
+        report_path = self._write_detailed_report(
+            layer_ids=loaded.layer_ids,
+            neuron_ids=loaded.neuron_ids,
+            effect_size=loaded.effect_size,
+            stability=stability,
+            silhouette_values=silhouette_values,
+            top_k=self.config.report_top_k,
+            make_plots=self.config.report_make_plots,
+        )
+
+        LOGGER.info(
+            "Done. total_neurons=%d stable_emotional=%d silhouette_mean=%.4f silhouette_std=%.4f",
+            loaded.feature_matrix.shape[0],
+            int(np.sum(stable_mask)),
+            float(np.mean(silhouette_values)),
+            float(np.std(silhouette_values)),
+        )
+        LOGGER.info("Saved: %s", json_path)
+        LOGGER.info("Summary: %s | %s", summary_json, summary_md)
+        LOGGER.info("Report : %s", report_path)
+        return json_path
+
+    # -----------------------------
+    # Loading
+    # -----------------------------
+    def _find_layer_files(self) -> List[Tuple[int, Path]]:
+        pattern = str(self.reports_dir / f"analyzer_{self.config.run_name}_layer_*.npz")
+        paths = glob.glob(pattern)
+        if not paths:
+            raise FileNotFoundError(
+                f"No analyzer files for run_name='{self.config.run_name}' in {self.reports_dir}."
+            )
+
+        parsed: List[Tuple[int, Path]] = []
+        for path_str in paths:
+            name = os.path.basename(path_str)
+            match = LAYER_FILE_RE.match(name)
+            if match is None:
+                continue
+            parsed.append((int(match.group("layer")), Path(path_str)))
+
+        if not parsed:
+            raise FileNotFoundError(
+                f"Matched files do not contain valid layer suffixes for run_name='{self.config.run_name}'."
+            )
+
+        parsed.sort(key=lambda pair: pair[0])
+        LOGGER.info("Found %d layer files for run '%s'.", len(parsed), self.config.run_name)
+        return parsed
+
+    def _load_metrics(self) -> LoadedMetrics:
         layer_files = self._find_layer_files()
-        all_records: list[NeuronRecord] = []
 
-        for layer_idx, path in layer_files:
-            logger.info("Завантаження шару %2d: %s", layer_idx, path.name)
-            records = self._load_layer(layer_idx, path)
-            all_records.extend(records)
+        layer_ids_chunks: List[np.ndarray] = []
+        neuron_ids_chunks: List[np.ndarray] = []
+        feature_chunks: List[np.ndarray] = []
+        effect_size_chunks: List[np.ndarray] = []
 
-        logger.info(
-            "Усього нейронів завантажено: %d (шарів: %d)",
-            len(all_records),
-            len(layer_files),
+        expected_neurons: int | None = None
+        for layer, path in layer_files:
+            with np.load(path) as data:
+                missing = [feat for feat in self.config.features if feat not in data]
+                if missing:
+                    raise KeyError(f"Missing features in {path}: {missing}")
+                if "effect_size" not in data:
+                    raise KeyError(f"Missing required effect_size in {path}")
+
+                columns = [np.asarray(data[feat], dtype=np.float64).reshape(-1) for feat in self.config.features]
+                current_effect = np.asarray(data["effect_size"], dtype=np.float64).reshape(-1)
+
+            n_neurons = columns[0].shape[0]
+            if expected_neurons is None:
+                expected_neurons = n_neurons
+            elif n_neurons != expected_neurons:
+                raise ValueError(
+                    f"Inconsistent neuron count across layers: expected {expected_neurons}, got {n_neurons} in layer {layer}."
+                )
+
+            for feat_arr, feat_name in zip(columns, self.config.features):
+                if feat_arr.shape[0] != n_neurons:
+                    raise ValueError(f"Feature '{feat_name}' in layer {layer} has incompatible shape.")
+                if not np.all(np.isfinite(feat_arr)):
+                    raise ValueError(f"Feature '{feat_name}' in layer {layer} contains non-finite values.")
+
+            if current_effect.shape[0] != n_neurons or not np.all(np.isfinite(current_effect)):
+                raise ValueError(f"effect_size in layer {layer} has invalid shape or non-finite values.")
+
+            layer_ids_chunks.append(np.full(n_neurons, layer, dtype=np.int32))
+            neuron_ids_chunks.append(np.arange(n_neurons, dtype=np.int32))
+            feature_chunks.append(np.column_stack(columns))
+            effect_size_chunks.append(current_effect)
+
+        layer_ids = np.concatenate(layer_ids_chunks, axis=0)
+        neuron_ids = np.concatenate(neuron_ids_chunks, axis=0)
+        feature_matrix = np.vstack(feature_chunks)
+        effect_size = np.concatenate(effect_size_chunks, axis=0)
+
+        LOGGER.info("Loaded feature matrix %s using features=%s", feature_matrix.shape, ",".join(self.config.features))
+        return LoadedMetrics(
+            layer_ids=layer_ids,
+            neuron_ids=neuron_ids,
+            feature_matrix=feature_matrix,
+            effect_size=effect_size,
         )
 
-        # 2. Матриця ознак
-        X_scaled, X_raw = self._build_feature_matrix(all_records)
-        logger.info(
-            "Матриця ознак: shape=%s, features=%s", X_scaled.shape, self.features
-        )
+    # -----------------------------
+    # Clustering
+    # -----------------------------
+    @staticmethod
+    def _standardize_features(x: np.ndarray) -> np.ndarray:
+        scaler = StandardScaler()
+        x_scaled = scaler.fit_transform(x)
+        if not np.all(np.isfinite(x_scaled)):
+            raise ValueError("Standardized feature matrix contains non-finite values.")
+        return x_scaled
 
-        # 3. Статистика effect_size для вибору порогу
-        effect_sizes = np.abs(np.array([r.effect_size for r in all_records]))
-        es_mean  = float(np.mean(effect_sizes))
-        es_std   = float(np.std(effect_sizes))
-        es_p75   = float(np.percentile(effect_sizes, 75))
-        es_p90   = float(np.percentile(effect_sizes, 90))
-        es_p95   = float(np.percentile(effect_sizes, 95))
-        logger.info(
-            "effect_size статистика: mean=%.4f std=%.4f "
-            "p75=%.4f p90=%.4f p95=%.4f",
-            es_mean, es_std, es_p75, es_p90, es_p95,
-        )
+    def _run_repeated_kmeans(
+        self,
+        *,
+        x_scaled: np.ndarray,
+        effect_size: np.ndarray,
+    ) -> Tuple[np.ndarray, List[float]]:
+        emotional_votes = np.zeros(x_scaled.shape[0], dtype=np.int32)
+        silhouette_values: List[float] = []
 
-        # Поріг = mean + 1*std (нейрони з помітно вищим ефектом)
-        effect_size_threshold = es_mean + es_std
-        logger.info(
-            "Поріг effect_size (mean+1σ): %.4f  "
-            "→ нейронів вище порогу: %d",
-            effect_size_threshold,
-            int(np.sum(effect_sizes >= effect_size_threshold)),
-        )
-
-        # 4. Головний запуск K-Means — визначаємо центроїди
-        labels_main, emotional_cluster_id, centroids_main = (
-            self._run_kmeans_once(X_scaled, random_state=42)
-        )
-
-        feature_idx = (
-            self.features.index("effect_size")
-            if "effect_size" in self.features
-            else 0
-        )
-        emo_centroid = centroids_main[emotional_cluster_id]
-        neu_centroid = centroids_main[1 - emotional_cluster_id]
-
-        # Відстань до центроїдів у головному запуску
-        dist_to_emo_main = np.linalg.norm(X_scaled - emo_centroid, axis=1)
-        dist_to_neu_main = np.linalg.norm(X_scaled - neu_centroid, axis=1)
-        in_emo_main = dist_to_emo_main < dist_to_neu_main  # shape (N,)
-
-        for rec, label, is_emo in zip(all_records, labels_main, in_emo_main):
-            rec.cluster_label = int(is_emo)  # 1 = емоційний, 0 = нейтральний
-
-        n_emotional_main = int(in_emo_main.sum())
-        logger.info(
-            "Головний запуск: емоційний кластер = %d  "
-            "(нейронів за відстанню: %d)",
-            emotional_cluster_id, n_emotional_main,
-        )
-
-        # 5. Silhouette Score
-        sil_score = float(
-            silhouette_score(
-                X_scaled,
-                labels_main,
-                sample_size=min(10_000, len(all_records)),
+        for run_idx in range(self.config.iterations):
+            random_state = self.config.random_seed + run_idx
+            model = KMeans(
+                n_clusters=2,
+                random_state=random_state,
+                n_init=self.config.n_init,
             )
-        )
-        logger.info("Silhouette Score: %.4f", sil_score)
+            labels = model.fit_predict(x_scaled)
 
-        # 6. Оцінка стабільності через відстань до центроїду
-        self._assess_stability(all_records, X_scaled, emotional_cluster_id)
+            emotional_cluster_id = self._identify_emotional_cluster(labels=labels, effect_size=effect_size)
+            emotional_mask = labels == emotional_cluster_id
+            emotional_votes += emotional_mask.astype(np.int32)
 
-        # 7. Фінальний відбір — гібридний критерій:
-        #    (a) ближчий до емоційного центроїду в головному запуску
-        #    (b) stability >= threshold
-        #    (c) |effect_size| >= mean + 1σ
-        stable_emotional = [
-            r
-            for r in all_records
-            if r.cluster_label == 1                          # (a) kmeans
-            and r.stability >= self.stability_threshold      # (b) стабільність
-            and abs(r.effect_size) >= effect_size_threshold  # (c) прямий поріг
+            sil = silhouette_score(x_scaled, labels)
+            silhouette_values.append(float(sil))
+            LOGGER.info(
+                "Run %d/%d | random_state=%d | silhouette=%.4f | emotional_count=%d",
+                run_idx + 1,
+                self.config.iterations,
+                random_state,
+                float(sil),
+                int(np.sum(emotional_mask)),
+            )
+
+        return emotional_votes, silhouette_values
+
+    @staticmethod
+    def _identify_emotional_cluster(labels: np.ndarray, effect_size: np.ndarray) -> int:
+        cluster_scores: Dict[int, float] = {}
+        for cluster_id in (0, 1):
+            mask = labels == cluster_id
+            if not np.any(mask):
+                cluster_scores[cluster_id] = -np.inf
+                continue
+            cluster_scores[cluster_id] = float(np.mean(np.abs(effect_size[mask])))
+        return int(max(cluster_scores, key=cluster_scores.get))
+
+    # -----------------------------
+    # Outputs
+    # -----------------------------
+    @staticmethod
+    def _build_stable_records(
+        *,
+        layer_ids: np.ndarray,
+        neuron_ids: np.ndarray,
+        effect_size: np.ndarray,
+        stability: np.ndarray,
+    ) -> Tuple[List[Dict[str, float]], np.ndarray]:
+        stable_mask = np.isclose(stability, 1.0)
+        idx = np.where(stable_mask)[0]
+        if idx.size == 0:
+            return [], stable_mask
+
+        order = np.argsort(np.abs(effect_size[idx]))[::-1]
+        ordered_idx = idx[order]
+        records = [
+            {
+                "layer": int(layer_ids[i]),
+                "neuron": int(neuron_ids[i]),
+                "effect_size": float(effect_size[i]),
+                "stability": float(stability[i]),
+            }
+            for i in ordered_idx
         ]
+        return records, stable_mask
 
-        # Якщо гібридний фільтр дає 0 — fallback тільки на effect_size
-        if len(stable_emotional) == 0:
-            logger.warning(
-                "Гібридний фільтр дав 0 нейронів. "
-                "Використовую fallback: тільки effect_size ≥ mean+1σ (%.4f).",
-                effect_size_threshold,
-            )
-            stable_emotional = [
-                r for r in all_records
-                if abs(r.effect_size) >= effect_size_threshold
-            ]
-            # Встановлюємо stability=1.0 для fallback нейронів
-            for r in stable_emotional:
-                r.stability = 1.0
+    def _write_emotional_clusters_json(self, records: List[Dict[str, float]]) -> str:
+        output_path = self.reports_dir / f"emotional_clusters_{self.config.run_name}.json"
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        return str(output_path)
 
-        stable_emotional.sort(key=lambda r: (r.layer, r.neuron))
+    def _write_summary(
+        self,
+        *,
+        records: List[Dict[str, float]],
+        layer_ids: np.ndarray,
+        stable_mask: np.ndarray,
+        silhouette_values: Sequence[float],
+        total_neurons: int,
+    ) -> Tuple[str, str]:
+        stable_count = int(np.sum(stable_mask))
+        per_layer_counts: Dict[int, int] = {}
+        if stable_mask.any():
+            unique_layers, counts = np.unique(layer_ids[stable_mask], return_counts=True)
+            per_layer_counts = {int(l): int(c) for l, c in zip(unique_layers, counts)}
 
-        logger.info(
-            "Фінальний список: %d емоційних нейронів", len(stable_emotional)
+        top_records = records[: min(self.config.report_top_k, len(records))]
+
+        sil = np.asarray(list(silhouette_values), dtype=np.float64)
+        sil_mean = float(np.mean(sil)) if sil.size else float("nan")
+        sil_std = float(np.std(sil)) if sil.size else float("nan")
+
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "run_name": self.config.run_name,
+            "features": list(self.config.features),
+            "iterations": int(self.config.iterations),
+            "random_seed": int(self.config.random_seed),
+            "n_init": int(self.config.n_init),
+            "total_neurons": int(total_neurons),
+            "stable_emotional_neurons": int(stable_count),
+            "stable_rate": float(stable_count / float(total_neurons)) if total_neurons else 0.0,
+            "silhouette": {
+                "mean": sil_mean,
+                "std": sil_std,
+                "values": [float(v) for v in sil.tolist()],
+            },
+            "stable_counts_per_layer": {str(k): v for k, v in sorted(per_layer_counts.items())},
+            "top_stable_neurons": top_records,
+            "full_output": f"emotional_clusters_{self.config.run_name}.json",
+        }
+
+        summary_json = self.reports_dir / f"emotional_clusters_{self.config.run_name}.summary.json"
+        summary_md = self.reports_dir / f"emotional_clusters_{self.config.run_name}.summary.md"
+
+        with summary_json.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        lines: List[str] = []
+        lines.append(f"# Emotional clusters summary — {self.config.run_name}")
+        lines.append("")
+        lines.append("## Коротко")
+        lines.append(f"- Total neurons: {total_neurons}")
+        lines.append(f"- Stable emotional neurons: {stable_count} ({payload['stable_rate']:.2%})")
+        lines.append(f"- Features: {', '.join(self.config.features)}")
+        lines.append(f"- K-Means runs: {self.config.iterations} (n_init={self.config.n_init})")
+        lines.append(f"- Silhouette mean/std: {sil_mean:.4f} / {sil_std:.4f}")
+        lines.append("")
+        lines.append("## Stable counts per layer")
+        if per_layer_counts:
+            for layer in sorted(per_layer_counts):
+                lines.append(f"- Layer {layer}: {per_layer_counts[layer]}")
+        else:
+            lines.append("- (none)")
+        lines.append("")
+        lines.append(f"## Top-{len(top_records)} stable neurons (by |effect_size|)")
+        if top_records:
+            lines.append("| rank | layer | neuron | effect_size | stability |")
+            lines.append("|---:|---:|---:|---:|---:|")
+            for rank, rec in enumerate(top_records, start=1):
+                lines.append(
+                    f"| {rank} | {rec['layer']} | {rec['neuron']} | {rec['effect_size']:.6g} | {rec['stability']:.3g} |"
+                )
+        else:
+            lines.append("No stable emotional neurons found (stability=1.0).")
+        lines.append("")
+        lines.append("## Full output")
+        lines.append(f"- emotional_clusters_{self.config.run_name}.json (може бути дуже великим)")
+        lines.append(f"- emotional_clusters_{self.config.run_name}.summary.json (машиночитний summary)")
+
+        summary_md.write_text("\n".join(lines), encoding="utf-8")
+        return str(summary_json), str(summary_md)
+
+    def _write_detailed_report(
+        self,
+        *,
+        layer_ids: np.ndarray,
+        neuron_ids: np.ndarray,
+        effect_size: np.ndarray,
+        stability: np.ndarray,
+        silhouette_values: Sequence[float],
+        top_k: int,
+        make_plots: bool,
+    ) -> str:
+        report_path = self.reports_dir / f"emotional_clusters_{self.config.run_name}.report.md"
+        stable_mask = np.isclose(stability, 1.0)
+        stable_idx = np.where(stable_mask)[0]
+        n_stable = stable_idx.size
+
+        unique_layers, counts = np.unique(layer_ids, return_counts=True)
+        per_layer_total = {int(l): int(c) for l, c in zip(unique_layers, counts)}
+        per_layer_stable: Dict[int, int] = {}
+        if stable_mask.any():
+            s_l, s_c = np.unique(layer_ids[stable_mask], return_counts=True)
+            per_layer_stable = {int(l): int(c) for l, c in zip(s_l, s_c)}
+
+        abs_effect_stable = np.abs(effect_size[stable_idx]) if n_stable else np.array([])
+        if n_stable:
+            order = np.argsort(abs_effect_stable)[::-1]
+            top_indices = stable_idx[order[: min(top_k, n_stable)]]
+        else:
+            top_indices = np.array([], dtype=int)
+
+        sil = np.asarray(list(silhouette_values), dtype=np.float64)
+        sil_mean = float(np.mean(sil)) if sil.size else float("nan")
+        sil_std = float(np.std(sil)) if sil.size else float("nan")
+        sil_min = float(np.min(sil)) if sil.size else float("nan")
+        sil_max = float(np.max(sil)) if sil.size else float("nan")
+
+        def fmt_per_layer() -> List[str]:
+            lines: List[str] = []
+            lines.append("| layer | stable | total | stable share |")
+            lines.append("|---:|---:|---:|---:|")
+            for l in sorted(per_layer_total):
+                stable_cnt = per_layer_stable.get(l, 0)
+                total_cnt = per_layer_total.get(l, 0)
+                share = (stable_cnt / total_cnt) if total_cnt else 0.0
+                lines.append(f"| {l} | {stable_cnt} | {total_cnt} | {share:.2%} |")
+            return lines
+
+        def fmt_top() -> List[str]:
+            if top_indices.size == 0:
+                return ["No stable emotional neurons under current criterion."]
+            lines: List[str] = []
+            lines.append("| rank | layer | neuron | effect_size | |effect_size| | stability |")
+            lines.append("|---:|---:|---:|---:|---:|---:|")
+            for rank, idx in enumerate(top_indices, start=1):
+                l = int(layer_ids[idx])
+                n = int(neuron_ids[idx])
+                es = float(effect_size[idx])
+                st = float(stability[idx])
+                lines.append(f"| {rank} | {l} | {n} | {es:.6g} | {abs(es):.6g} | {st:.3g} |")
+            return lines
+
+        lines: List[str] = []
+        lines.append(f"# Clustering report — {self.config.run_name}")
+        lines.append("")
+        lines.append("## Inputs")
+        lines.append(f"- run_name: {self.config.run_name}")
+        lines.append(f"- features: {', '.join(self.config.features)}")
+        lines.append(
+            f"- iterations: {self.config.iterations} (random_seed base={self.config.random_seed}, n_init={self.config.n_init})"
         )
+        lines.append(f"- total neurons: {effect_size.shape[0]}")
+        lines.append("")
+        lines.append("## Result size")
+        lines.append(f"- stable emotional: {n_stable} ({(n_stable / effect_size.shape[0]):.2%})")
+        lines.append("")
+        lines.append("## Clustering quality (silhouette)")
+        lines.append(f"- mean={sil_mean:.4f}, std={sil_std:.4f}, min={sil_min:.4f}, max={sil_max:.4f}")
+        lines.append("")
+        lines.append("## Stable counts per layer")
+        lines.extend(fmt_per_layer())
+        lines.append("")
+        lines.append(f"## Top {min(top_k, n_stable)} stable emotional neurons (by |effect_size|)")
+        lines.extend(fmt_top())
+        lines.append("")
+        lines.append("## Files")
+        lines.append(f"- emotional_clusters_{self.config.run_name}.json (full)")
+        lines.append(f"- emotional_clusters_{self.config.run_name}.summary.json (short)")
+        lines.append(f"- emotional_clusters_{self.config.run_name}.summary.md (short)")
 
-        return ClusteringResult(
-            run_name=self.run_name,
-            n_neurons_total=len(all_records),
-            n_emotional=n_emotional_main,
-            silhouette=sil_score,
-            emotional_cluster_id=emotional_cluster_id,
-            stability_threshold=self.stability_threshold,
-            stable_neurons=stable_emotional,
-        )
+        if make_plots and n_stable > 0:
+            try:
+                import matplotlib.pyplot as plt  # type: ignore
 
-    def save_results(self, result: ClusteringResult) -> Path:
-        """
-        Зберігає стабільні емоційні нейрони у JSON-файл.
+                fig, ax = plt.subplots(figsize=(8, 3))
+                ax.bar(sorted(per_layer_total), [per_layer_stable.get(l, 0) for l in sorted(per_layer_total)])
+                ax.set_xlabel("Layer")
+                ax.set_ylabel("Stable emotional count")
+                ax.set_title("Stable emotional neurons per layer")
+                bar_path = self.reports_dir / f"emotional_clusters_{self.config.run_name}.per_layer.png"
+                fig.tight_layout()
+                fig.savefig(bar_path, dpi=160)
+                plt.close(fig)
+                lines.append(f"- Plot: {bar_path.name}")
 
-        Parameters
-        ----------
-        result : ClusteringResult
+                fig, ax = plt.subplots(figsize=(8, 3))
+                ax.hist(abs_effect_stable, bins=50)
+                ax.set_xlabel("|effect_size|")
+                ax.set_ylabel("Count")
+                ax.set_title("|effect_size| for stable emotional neurons")
+                hist_path = self.reports_dir / f"emotional_clusters_{self.config.run_name}.abs_effect_hist.png"
+                fig.tight_layout()
+                fig.savefig(hist_path, dpi=160)
+                plt.close(fig)
+                lines.append(f"- Plot: {hist_path.name}")
+            except Exception as exc:  # pragma: no cover
+                LOGGER.warning("Plot generation skipped: %s", exc)
+                lines.append("- Plot generation skipped (matplotlib missing or error).")
 
-        Returns
-        -------
-        Path
-            Шлях до збереженого файлу.
-        """
-        output_path = self.reports_dir / f"emotional_clusters_{self.run_name}.json"
-
-        payload = [r.to_dict() for r in result.stable_neurons]
-
-        try:
-            with open(output_path, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False, indent=2)
-        except OSError as exc:
-            raise IOError(f"Не вдалося зберегти результати у {output_path}: {exc}") from exc
-
-        logger.info("Результати збережено: %s (%d записів)", output_path, len(payload))
-        return output_path
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        return str(report_path)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
-def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="clustering.py",
-        description=(
-            "Бінарна кластеризація нейронів GPT-2 на 'емоційні' та 'нейтральні'. "
-            "Читає .npz файли з outputs/reports/ та зберігає JSON з результатами."
-        ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Cluster GPT-2 neurons into emotional/neutral groups using analyzer metrics.",
     )
-
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        required=True,
-        help="Назва запуску (відповідає назві в analyzer_<run_name>_layer_*.npz).",
-    )
+    parser.add_argument("--run_name", required=True, help="Run identifier, e.g. run_20260225_0035")
     parser.add_argument(
         "--features",
         nargs="+",
         default=["effect_size", "eta2"],
-        choices=list(NeuronClusterizer.SUPPORTED_FEATURES),
-        help="Метрики для кластеризації.",
+        help="Feature list for clustering (must exist in analyzer .npz)",
     )
+    parser.add_argument("--iterations", type=int, default=10, help="Number of K-Means runs for stability.")
+    parser.add_argument("--random_seed", type=int, default=42, help="Base random seed; each run adds +i.")
+    parser.add_argument("--n_init", type=int, default=20, help="K-Means n_init per run.")
     parser.add_argument(
-        "--n_iter",
+        "--report_top_k",
         type=int,
-        default=10,
-        metavar="N",
-        help="Кількість незалежних запусків K-Means для оцінки стабільності.",
+        default=50,
+        help="How many stable neurons to show in reports (by |effect_size|).",
     )
     parser.add_argument(
-        "--reports_dir",
-        type=str,
-        default=None,
-        help=(
-            "Директорія з .npz файлами та для збереження результатів. "
-            "За замовчуванням: <project_root>/outputs/reports/"
-        ),
+        "--report_make_plots",
+        action="store_true",
+        help="Generate PNG plots in reports (requires matplotlib).",
     )
-    parser.add_argument(
-        "--stability_threshold",
-        type=float,
-        default=0.8,
-        metavar="FLOAT",
-        help=(
-            "Мінімальна частка запусків K-Means, у яких нейрон має потрапити "
-            "в емоційний кластер (0.0–1.0, default: 0.8 = 80%%)."
-        ),
-    )
-
     return parser.parse_args(argv)
 
 
-def _resolve_reports_dir(override: Optional[str]) -> Path:
-    """
-    Визначає шлях до outputs/reports/ відносно кореня проєкту.
-
-    Структура: <root>/src/clustering.py → <root>/outputs/reports/
-    """
-    if override:
-        path = Path(override).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"Вказана директорія не існує: {path}")
-        return path
-
-    # __file__ = .../LLM-EMOTION-INTERPRETABILITY/src/clustering.py
-    src_dir = Path(os.path.abspath(__file__)).parent
-    project_root = src_dir.parent
-    reports_dir = project_root / "outputs" / "reports"
-
-    if not reports_dir.exists():
-        logger.info("Директорія %s не існує — створюємо.", reports_dir)
-        reports_dir.mkdir(parents=True, exist_ok=True)
-
-    return reports_dir
+def validate_args(args: argparse.Namespace) -> None:
+    if args.iterations <= 0:
+        raise ValueError("--iterations must be > 0")
+    if args.n_init <= 0:
+        raise ValueError("--n_init must be > 0")
+    if not args.features:
+        raise ValueError("--features must contain at least one feature")
 
 
-def main(argv: Optional[list[str]] = None) -> None:
-    """Точка входу CLI."""
-    args = _parse_args(argv)
+def main(argv: Sequence[str] | None = None) -> None:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    args = parse_args(argv)
+    validate_args(args)
 
-    logger.info("=" * 60)
-    logger.info("  LLM Emotion Interpretability — Clustering")
-    logger.info("  run_name            : %s", args.run_name)
-    logger.info("  features            : %s", args.features)
-    logger.info("  n_iter              : %d", args.n_iter)
-    logger.info("  stability_threshold : %.0f%%", args.stability_threshold * 100)
-    logger.info("=" * 60)
+    config = ClusterConfig(
+        run_name=str(args.run_name),
+        features=tuple(str(f) for f in args.features),
+        iterations=int(args.iterations),
+        random_seed=int(args.random_seed),
+        n_init=int(args.n_init),
+        report_top_k=int(args.report_top_k),
+        report_make_plots=bool(args.report_make_plots),
+    )
 
-    try:
-        reports_dir = _resolve_reports_dir(args.reports_dir)
-        logger.info("Директорія звітів: %s", reports_dir)
-
-        clusterizer = NeuronClusterizer(
-            run_name=args.run_name,
-            features=args.features,
-            n_iter=args.n_iter,
-            reports_dir=reports_dir,
-            stability_threshold=args.stability_threshold,
-        )
-
-        result = clusterizer.run()
-        clusterizer.save_results(result)
-
-        print(result.summary())
-
-    except (FileNotFoundError, KeyError, ValueError, IOError) as exc:
-        logger.error("Критична помилка: %s", exc)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        logger.warning("Перервано користувачем.")
-        sys.exit(130)
+    clusterizer = NeuronClusterizer(config)
+    clusterizer.run()
 
 
 if __name__ == "__main__":

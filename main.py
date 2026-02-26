@@ -6,7 +6,8 @@ LLM-Emotion-Interpretability — Pipeline Entrypoint
 Orchestrates the full research pipeline:
   1. model_inspector  — extract MLP activations from GPT-2
   2. analyzer         — compute statistical metrics (delta, Cohen's d, eta2, snr)
-  3. visualizer       — generate heatmaps and reports
+    3. visualizer       — generate heatmaps and reports
+    4. clustering       — split neurons into emotional vs neutral clusters
 
 Usage:
     python main.py                         # full pipeline
@@ -14,8 +15,8 @@ Usage:
     python main.py --run_dir data/activations/run_20260225_2122  # use specific run
     python main.py --bootstrap             # enable bootstrap validation
     python main.py --top_n 50             # top-N neurons in visualizations
+    python main.py --cluster_features effect_size eta2 --clustering_iterations 10
 """
-
 from __future__ import annotations
 import argparse
 import glob
@@ -46,6 +47,33 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("pipeline")
+
+def _clean_outputs(run_name: Optional[str]) -> None:
+    """Remove previous reports/heatmaps artifacts to start fresh."""
+    reports_dir = os.path.join(_REPO_ROOT, "outputs", "reports")
+    heatmaps_dir = os.path.join(_REPO_ROOT, "outputs", "heatmaps")
+
+    def _remove(dir_path: str, patterns: list[str]) -> None:
+        if not os.path.isdir(dir_path):
+            return
+        for pat in patterns:
+            for path in glob.glob(os.path.join(dir_path, pat)):
+                if os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                        log.info("Removed: %s", path)
+                    except OSError as exc:  # pragma: no cover
+                        log.warning("Could not remove %s: %s", path, exc)
+
+    if run_name:
+        patterns_reports = [f"*{run_name}*.json", f"*{run_name}*.npz", f"*{run_name}*.md", f"*{run_name}*.png"]
+        patterns_heatmaps = [f"*{run_name}*"]
+    else:
+        patterns_reports = ["*.json", "*.npz", "*.md", "*.png"]
+        patterns_heatmaps = ["*"]
+
+    _remove(reports_dir, patterns_reports)
+    _remove(heatmaps_dir, patterns_heatmaps)
 
 try:
     from colorama import init as _colorama_init, Fore, Style
@@ -150,11 +178,38 @@ def step_visualize(run_dir: str, top_n: int, no_html: bool) -> str:
     )
     return viz.run_all()
 
+
+def step_cluster(
+    run_dir: str,
+    features: list[str],
+    iterations: int,
+    random_seed: int,
+    n_init: int,
+    report_top_k: int,
+    report_make_plots: bool,
+) -> str:
+    """Run clustering and return path to emotional_clusters JSON."""
+    from clustering import ClusterConfig, NeuronClusterizer
+
+    run_name = os.path.basename(os.path.normpath(run_dir))
+    config = ClusterConfig(
+        run_name=run_name,
+        features=tuple(features),
+        iterations=iterations,
+        random_seed=random_seed,
+        n_init=n_init,
+        report_top_k=report_top_k,
+        report_make_plots=report_make_plots,
+    )
+    clusterizer = NeuronClusterizer(config)
+    return clusterizer.run()
+
 def _print_summary(
     run_dir: str,
     timings: dict,
     bootstrap: bool,
     out_heatmap_dir: str,
+    emotional_clusters_path: str,
 ) -> None:
     run_name = os.path.basename(os.path.normpath(run_dir))
     total    = sum(timings.values())
@@ -176,6 +231,8 @@ def _print_summary(
     print(f"    Heatmaps / PNG  : {out_heatmap_dir}")
     reports_dir = os.path.join(_REPO_ROOT, "outputs", "reports")
     print(f"    Reports / JSON  : {reports_dir}")
+    if emotional_clusters_path:
+        print(f"    Emotional clusters: {emotional_clusters_path}")
     if bootstrap:
         boot_path = os.path.join(reports_dir, f"bootstrap_{run_name}.json")
         exists = os.path.isfile(boot_path)
@@ -234,15 +291,63 @@ Examples:
     p.add_argument(
         "--steps",
         nargs="+",
-        choices=["inspect", "analyze", "visualize"],
-        default=["inspect", "analyze", "visualize"],
-        help="Which steps to run (default: all three).",
+        choices=["inspect", "analyze", "visualize", "clustering"],
+        default=["inspect", "analyze", "visualize", "clustering"],
+        help="Which steps to run (default: all four).",
+    )
+    p.add_argument(
+        "--clean_outputs",
+        action="store_true",
+        help="Remove previous outputs (reports/heatmaps) before running steps.",
+    )
+    p.add_argument(
+        "--clean_run_name",
+        default=None,
+        help="Optional token to clean only matching run outputs (default: clean all).",
+    )
+    p.add_argument(
+        "--cluster_features",
+        nargs="+",
+        default=["effect_size", "eta2"],
+        help="Features used by clustering step (default: effect_size eta2).",
+    )
+    p.add_argument(
+        "--clustering_iterations",
+        type=int,
+        default=10,
+        help="Number of repeated K-Means runs in clustering (default: 10).",
+    )
+    p.add_argument(
+        "--clustering_random_seed",
+        type=int,
+        default=42,
+        help="Base random seed for clustering (default: 42).",
+    )
+    p.add_argument(
+        "--clustering_n_init",
+        type=int,
+        default=20,
+        help="K-Means n_init in clustering step (default: 20).",
+    )
+    p.add_argument(
+        "--cluster_report_top_k",
+        type=int,
+        default=50,
+        help="Top-K stable emotional neurons to include in report (default: 50).",
+    )
+    p.add_argument(
+        "--cluster_report_make_plots",
+        action="store_true",
+        help="Generate PNG plots in clustering report (requires matplotlib).",
     )
     return p
 
 def main(argv: Optional[list] = None) -> int:
     parser = _build_parser()
     args   = parser.parse_args(argv)
+
+    if args.clean_outputs:
+        _clean_outputs(run_name=args.clean_run_name)
 
     # Resolve step list
     steps = set(args.steps)
@@ -254,6 +359,7 @@ def main(argv: Optional[list] = None) -> int:
     timings     = {}
     run_dir: Optional[str] = args.run_dir
     out_heatmap_dir: str   = ""
+    emotional_clusters_path: str = ""
 
     print(_c(_BANNER, Fore.MAGENTA))
     log.info("Pipeline started  |  steps=%s  |  log=%s", sorted(steps), _LOG_FILE)
@@ -320,11 +426,32 @@ def main(argv: Optional[list] = None) -> int:
             log.error("visualizer FAILED:\n%s", traceback.format_exc())
             return 1
 
+    if "clustering" in steps:
+        step_num += 1
+        try:
+            emotional_clusters_path, elapsed = _run_step(
+                step_num, total_steps,
+                "clustering  --  emotional vs neutral neuron groups",
+                step_cluster,
+                run_dir,
+                args.cluster_features,
+                args.clustering_iterations,
+                args.clustering_random_seed,
+                args.clustering_n_init,
+                args.cluster_report_top_k,
+                args.cluster_report_make_plots,
+            )
+            timings["clustering"] = elapsed
+        except Exception:
+            log.error("clustering FAILED:\n%s", traceback.format_exc())
+            return 1
+
     _print_summary(
         run_dir=run_dir,
         timings=timings,
         bootstrap=args.bootstrap,
         out_heatmap_dir=out_heatmap_dir,
+        emotional_clusters_path=emotional_clusters_path,
     )
     log.info("Pipeline finished successfully.")
     return 0
