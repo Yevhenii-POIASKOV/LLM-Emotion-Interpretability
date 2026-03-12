@@ -13,3 +13,4 @@ __pycache__/
 *.pyo
 outputs/logs/
 **/.gitkeep
+experiments/
